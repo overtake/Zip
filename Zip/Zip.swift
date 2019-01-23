@@ -17,6 +17,7 @@ public enum ZipError: Error {
     case unzipFail
     /// Zip fail
     case zipFail
+    case sizeLimit
     
     /// User readable description
     public var description: String {
@@ -24,6 +25,7 @@ public enum ZipError: Error {
         case .fileNotFound: return NSLocalizedString("File not found.", comment: "")
         case .unzipFail: return NSLocalizedString("Failed to unzip file.", comment: "")
         case .zipFail: return NSLocalizedString("Failed to zip file.", comment: "")
+        case .sizeLimit: return NSLocalizedString("1.5 GB Limit.", comment: "")
         }
     }
 }
@@ -60,6 +62,7 @@ public struct ArchiveFile {
         self.modifiedTime = modifiedTime
     }
 }
+
 
 
 /// Zip class
@@ -278,7 +281,10 @@ public class Zip {
      
      - notes: Supports implicit progress composition
      */
-    public class func zipFiles(paths: [URL], zipFilePath: URL, password: String?, compression: ZipCompression = .DefaultCompression, progress: ((_ progress: Double) -> ())?) throws {
+    public class func zipFiles(paths: [URL], zipFilePath: URL, password: String?, compression: ZipCompression = .DefaultCompression, progress: ((_ progress: Double) -> ())?, cancel:@escaping()->Bool = { return false }) throws {
+        
+        
+
         
         // File manager
         let fileManager = FileManager.default
@@ -297,84 +303,105 @@ public class Zip {
         var totalSize: Double = 0.0
         // Get totalSize for progress handler
         for path in processedPaths {
-            do {
+            if !cancel() {
                 let filePath = path.filePath()
-                let fileAttributes = try fileManager.attributesOfItem(atPath: filePath)
-                let fileSize = fileAttributes[FileAttributeKey.size] as? Double
+                let fileAttributes = try? fileManager.attributesOfItem(atPath: filePath)
+                let fileSize = fileAttributes?[FileAttributeKey.size] as? Double
                 if let fileSize = fileSize {
                     totalSize += fileSize
                 }
+                if totalSize > 1500 * 1024 * 1024 {
+                    throw ZipError.sizeLimit
+                }
+            } else {
+                return
             }
-            catch {}
+            
+        }
+        
+        if let progressHandler = progress {
+            progressHandler(0.0)
         }
         
         let progressTracker = Progress(totalUnitCount: Int64(totalSize))
-        progressTracker.isCancellable = false
+        progressTracker.isCancellable = true
         progressTracker.isPausable = false
         progressTracker.kind = ProgressKind.file
         
+
+        
+        var cancelled: Bool = false
         // Begin Zipping
         let zip = zipOpen(destinationPath, APPEND_STATUS_CREATE)
         for path in processedPaths {
-            let filePath = path.filePath()
-            var isDirectory: ObjCBool = false
-            fileManager.fileExists(atPath: filePath, isDirectory: &isDirectory)
-            if !isDirectory.boolValue {
-                let input = fopen(filePath, "r")
-                if input == nil {
-                    throw ZipError.zipFail
-                }
-                let fileName = path.fileName
-                var zipInfo: zip_fileinfo = zip_fileinfo(tmz_date: tm_zip(tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0), dosDate: 0, internal_fa: 0, external_fa: 0)
-                do {
-                    let fileAttributes = try fileManager.attributesOfItem(atPath: filePath)
-                    if let fileDate = fileAttributes[FileAttributeKey.modificationDate] as? Date {
-                        let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: fileDate)
-                        zipInfo.tmz_date.tm_sec = UInt32(components.second!)
-                        zipInfo.tmz_date.tm_min = UInt32(components.minute!)
-                        zipInfo.tmz_date.tm_hour = UInt32(components.hour!)
-                        zipInfo.tmz_date.tm_mday = UInt32(components.day!)
-                        zipInfo.tmz_date.tm_mon = UInt32(components.month!) - 1
-                        zipInfo.tmz_date.tm_year = UInt32(components.year!)
+            if !cancel() {
+                let filePath = path.filePath()
+                var isDirectory: ObjCBool = false
+                fileManager.fileExists(atPath: filePath, isDirectory: &isDirectory)
+                if !isDirectory.boolValue {
+                    let input = fopen(filePath, "r")
+                    if input == nil {
+                        throw ZipError.zipFail
                     }
-                    if let fileSize = fileAttributes[FileAttributeKey.size] as? Double {
-                        currentPosition += fileSize
+                    let fileName = path.fileName
+                    var zipInfo: zip_fileinfo = zip_fileinfo(tmz_date: tm_zip(tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0), dosDate: 0, internal_fa: 0, external_fa: 0)
+                    do {
+                        let fileAttributes = try fileManager.attributesOfItem(atPath: filePath)
+                        if let fileDate = fileAttributes[FileAttributeKey.modificationDate] as? Date {
+                            let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: fileDate)
+                            zipInfo.tmz_date.tm_sec = UInt32(components.second!)
+                            zipInfo.tmz_date.tm_min = UInt32(components.minute!)
+                            zipInfo.tmz_date.tm_hour = UInt32(components.hour!)
+                            zipInfo.tmz_date.tm_mday = UInt32(components.day!)
+                            zipInfo.tmz_date.tm_mon = UInt32(components.month!) - 1
+                            zipInfo.tmz_date.tm_year = UInt32(components.year!)
+                        }
+                        if let fileSize = fileAttributes[FileAttributeKey.size] as? Double {
+                            currentPosition += fileSize
+                        }
                     }
+                    catch {}
+                    let buffer = malloc(chunkSize)
+                    if let password = password, let fileName = fileName {
+                        zipOpenNewFileInZip3(zip, fileName, &zipInfo, nil, 0, nil, 0, nil,Z_DEFLATED, compression.minizipCompression, 0, -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY, password, 0)
+                    }
+                    else if let fileName = fileName {
+                        zipOpenNewFileInZip3(zip, fileName, &zipInfo, nil, 0, nil, 0, nil,Z_DEFLATED, compression.minizipCompression, 0, -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY, nil, 0)
+                    }
+                    else {
+                        throw ZipError.zipFail
+                    }
+                    var length: Int = 0
+                    while (feof(input) == 0) {
+                        length = fread(buffer, 1, chunkSize, input)
+                        zipWriteInFileInZip(zip, buffer, UInt32(length))
+                    }
+                    
+                    // Update progress handler
+                    if let progressHandler = progress{
+                        progressHandler((currentPosition/totalSize))
+                    }
+                    
+                    progressTracker.completedUnitCount = Int64(currentPosition)
+                    
+                    zipCloseFileInZip(zip)
+                    free(buffer)
+                    fclose(input)
                 }
-                catch {}
-                let buffer = malloc(chunkSize)
-                if let password = password, let fileName = fileName {
-                    zipOpenNewFileInZip3(zip, fileName, &zipInfo, nil, 0, nil, 0, nil,Z_DEFLATED, compression.minizipCompression, 0, -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY, password, 0)
-                }
-                else if let fileName = fileName {
-                    zipOpenNewFileInZip3(zip, fileName, &zipInfo, nil, 0, nil, 0, nil,Z_DEFLATED, compression.minizipCompression, 0, -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY, nil, 0)
-                }
-                else {
-                    throw ZipError.zipFail
-                }
-                var length: Int = 0
-                while (feof(input) == 0) {
-                    length = fread(buffer, 1, chunkSize, input)
-                    zipWriteInFileInZip(zip, buffer, UInt32(length))
-                }
-                
-                // Update progress handler
-                if let progressHandler = progress{
-                    progressHandler((currentPosition/totalSize))
-                }
-                
-                progressTracker.completedUnitCount = Int64(currentPosition)
-                
-                zipCloseFileInZip(zip)
-                free(buffer)
-                fclose(input)
+            } else {
+                cancelled = true
+                progressTracker.cancel()
+                break
             }
         }
         zipClose(zip, nil)
-        
         // Completed. Update progress handler.
         if let progressHandler = progress{
             progressHandler(1.0)
+        }
+        
+        if cancelled {
+            try? FileManager.default.removeItem(atPath: destinationPath)
         }
         
         progressTracker.completedUnitCount = Int64(totalSize)
