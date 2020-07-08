@@ -25,7 +25,7 @@ public enum ZipError: Error {
         case .fileNotFound: return NSLocalizedString("File not found.", comment: "")
         case .unzipFail: return NSLocalizedString("Failed to unzip file.", comment: "")
         case .zipFail: return NSLocalizedString("Failed to zip file.", comment: "")
-        case .sizeLimit: return NSLocalizedString("1.5 GB Limit.", comment: "")
+        case .sizeLimit: return NSLocalizedString("2.0 GB Limit.", comment: "")
         }
     }
 }
